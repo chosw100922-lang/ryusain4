@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>얼굴 좌표 추적 앱</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1220;--panel:#121d30;--line:#263752;--green:#43e28c;--muted:#9fb0c8}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#172943,var(--bg) 55%);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#edf4ff}
+main{max-width:1050px;margin:auto;padding:24px 16px 40px}h1{margin:0 0 8px;font-size:clamp(1.5rem,4vw,2.2rem)}.sub{color:var(--muted);margin:0 0 22px}
+.layout{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(260px,1fr);gap:16px}.card{background:#101a2bcc;border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:0 12px 32px #0003}
+.video-wrap{position:relative;background:#050a12;border-radius:12px;overflow:hidden;min-height:260px;aspect-ratio:4/3;display:grid;place-items:center}
+video,canvas{position:absolute;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}#overlay{pointer-events:none}.placeholder{color:var(--muted);text-align:center;padding:24px;max-width:340px}
+.controls{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}button{border:0;border-radius:10px;padding:11px 16px;font-weight:700;cursor:pointer;background:var(--green);color:#07150d}button.secondary{background:#263752;color:#edf4ff}button:disabled{opacity:.5;cursor:not-allowed}
+.status{font-size:.92rem;color:var(--muted);margin-top:12px;min-height:1.4em}.status.error{color:#ff9b9b}.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.stat{background:#0b1424;border:1px solid var(--line);border-radius:12px;padding:14px}.stat span{display:block;color:var(--muted);font-size:.83rem}.stat strong{display:block;font-size:1.35rem;margin-top:5px;font-variant-numeric:tabular-nums;color:var(--green)}
+h2{font-size:1.08rem;margin:0 0 12px}.note{font-size:.88rem;line-height:1.6;color:var(--muted);margin-top:16px}.pill{display:inline-block;background:#20344d;border-radius:999px;padding:5px 9px;font-size:.78rem;color:#b9d4f7;margin-bottom:12px}
+@media(max-width:760px){.layout{grid-template-columns:1fr}main{padding:18px 12px}.video-wrap{min-height:220px}}
+</style>
+</head>
+<body>
+<main>
+  <h1>얼굴 좌표 추적</h1>
+  <p class="sub">웹캠 영상에서 얼굴 위치와 머리 기울기를 실시간으로 표시합니다.</p>
+  <div class="layout">
+    <section class="card">
+      <div class="pill">브라우저 카메라 사용</div>
+      <div class="video-wrap" id="videoWrap">
+        <div class="placeholder" id="placeholder">시작 버튼을 누르고 카메라 권한을 허용하세요.<br>HTTPS 또는 localhost에서 실행해야 합니다.</div>
+        <video id="video" autoplay muted playsinline hidden></video>
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="controls">
+        <button id="startBtn">카메라 시작</button>
+        <button id="stopBtn" class="secondary" disabled>중지</button>
+      </div>
+      <div id="status" class="status">모델을 아직 불러오지 않았습니다.</div>
+    </section>
+    <aside class="card">
+      <h2>실시간 측정값</h2>
+      <div class="stats">
+        <div class="stat"><span>X · 가로 중심 (0–1)</span><strong id="xVal">—</strong></div>
+        <div class="stat"><span>Y · 세로 중심 (0–1)</span><strong id="yVal">—</strong></div>
+        <div class="stat"><span>Z · 상대 깊이</span><strong id="zVal">—</strong></div>
+        <div class="stat"><span>Pitch · 위아래 기울기</span><strong id="pitchVal">—</strong></div>
+        <div class="stat"><span>Roll · 좌우 기울기</span><strong id="rollVal">—</strong></div>
+        <div class="stat"><span>얼굴 검출</span><strong id="detectVal">대기</strong></div>
+      </div>
+      <p class="note"><b>측정값 안내</b><br>
+      X와 Y는 화면 안 얼굴 중심의 정규화 좌표입니다. Z는 얼굴 너비를 기준으로 계산한 상대값이며 실제 거리(m)가 아닙니다. Pitch는 코와 눈·입의 상대 위치로 추정한 값이고, Roll은 양쪽 눈의 기울기로 계산합니다. 이 두 각도는 정밀한 3D 머리 자세 측정값이 아닌 근사치입니다.</p>
+    </aside>
+  </div>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+  const startBtn = $('startBtn'), stopBtn = $('stopBtn'), status = $('status');
+  let stream = null, running = false, busy = false, detector = null, rafId = null;
+  const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
+
+  function setStatus(message, isError=false) {
+    status.textContent = message;
+    status.classList.toggle('error', isError);
+  }
+  function resetValues() {
+    ['xVal','yVal','zVal','pitchVal','rollVal'].forEach(id => $(id).textContent='—');
+    $('detectVal').textContent='미검출';
+  }
+  function resizeCanvas() {
+    if (!video.videoWidth || !video.videoHeight) return;
+    const rect = video.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(rect.width*dpr);
+    canvas.height = Math.round(rect.height*dpr);
+    canvas.style.width = rect.width+'px';
+    canvas.style.height = rect.height+'px';
+  }
+  function drawBox(box, landmarks) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const sx = canvas.width / vw, sy = canvas.height / vh;
+    // Video와 canvas가 모두 CSS로 좌우 반전되므로 원본 영상 좌표를 그대로 그립니다.
+    // canvas 자체가 화면에서 반전되어 초록색 상자도 얼굴을 따라갑니다.
+    const x = box.x * sx;
+    const y = box.y * sy, w = box.width*sx, h = box.height*sy;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.lineWidth = Math.max(2, canvas.width/450);
+    ctx.strokeStyle = '#43e28c'; ctx.strokeRect(x,y,w,h);
+    ctx.fillStyle = '#43e28c';
+    if (landmarks) {
+      for (const p of landmarks) {
+        ctx.beginPath(); ctx.arc(p.x*sx,p.y*sy,Math.max(1.5,canvas.width/500),0,Math.PI*2); ctx.fill();
+      }
+    }
+  }
+  function angleDeg(a,b) { return Math.atan2(b.y-a.y,b.x-a.x)*180/Math.PI; }
+  function estimatePitch(pts, box) {
+    // Approximation from nose position relative to eye line and face height.
+    const leftEye = pts[36], rightEye = pts[45], nose = pts[30], chin = pts[8];
+    if (!leftEye || !rightEye || !nose || !chin) return 0;
+    const eyeMidY = (leftEye.y+rightEye.y)/2;
+    const faceH = Math.max(box.height,1);
+    const ratio = (nose.y-eyeMidY)/faceH;
+    // Neutral frontal faces are often around 0.30; this is a visual heuristic.
+    return Math.max(-60, Math.min(60, (ratio-0.30)*220));
+  }
+  async function start() {
+    startBtn.disabled = true;
+    setStatus('얼굴 인식 모델을 불러오는 중…');
+    try {
+      if (!window.faceapi) {
+        await new Promise((resolve,reject) => {
+          const s=document.createElement('script');
+          s.src='https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js';
+          s.onload=resolve; s.onerror=()=>reject(new Error('얼굴 인식 라이브러리를 불러오지 못했습니다. 네트워크 또는 CDN 접근을 확인하세요.'));
+          document.head.appendChild(s);
+        });
+      }
+      await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+        faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL)
+      ]);
+      stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});
+      video.srcObject = stream;
+      video.hidden = false;
+      $('placeholder').hidden = true;
+      await video.play();
+      running = true; stopBtn.disabled = false;
+      resizeCanvas();
+      setStatus('실행 중 · 얼굴을 카메라 정면에 맞춰 보세요.');
+      loop();
+    } catch (err) {
+      startBtn.disabled = false;
+      setStatus((err && err.name==='NotAllowedError')
+        ? '카메라 권한이 거부되었습니다. 주소창의 사이트 설정에서 카메라를 허용하세요.'
+        : (err && err.name==='NotFoundError')
+          ? '사용 가능한 카메라를 찾지 못했습니다.'
+          : (err.message || '시작하지 못했습니다.'), true);
+      stopCamera(false);
+    }
+  }
+  async function loop() {
+    if (!running) return;
+    if (video.readyState >= 2 && !busy) {
+      busy = true;
+      try {
+        const result = await faceapi.detectSingleFace(video,
+          new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.45}))
+          .withFaceLandmarks();
+        resizeCanvas();
+        if (result) {
+          const box = result.detection.box;
+          const pts = result.landmarks.positions;
+          drawBox(box, pts);
+          const x = 1 - (box.x+box.width/2)/video.videoWidth;
+          const y = (box.y+box.height/2)/video.videoHeight;
+          const z = 1/Math.max(box.width/video.videoWidth,0.001);
+          const leftEye = result.landmarks.getLeftEye();
+          const rightEye = result.landmarks.getRightEye();
+          const eyeAngle = angleDeg(
+            {x:leftEye.reduce((s,p)=>s+p.x,0)/leftEye.length,y:leftEye.reduce((s,p)=>s+p.y,0)/leftEye.length},
+            {x:rightEye.reduce((s,p)=>s+p.x,0)/rightEye.length,y:rightEye.reduce((s,p)=>s+p.y,0)/rightEye.length});
+          const roll = -eyeAngle;
+          const pitch = estimatePitch(pts, box);
+          $('xVal').textContent=x.toFixed(3);
+          $('yVal').textContent=y.toFixed(3);
+          $('zVal').textContent=z.toFixed(2);
+          $('pitchVal').textContent=pitch.toFixed(1)+'°';
+          $('rollVal').textContent=roll.toFixed(1)+'°';
+          $('detectVal').textContent='검출됨';
+        } else {
+          ctx.clearRect(0,0,canvas.width,canvas.height);
+          resetValues();
+        }
+      } catch (e) {
+        setStatus('얼굴 분석 중 오류: '+e.message,true);
+      } finally { busy=false; }
+    }
+    if (running) rafId=requestAnimationFrame(loop);
+  }
+  function stopCamera(update=true) {
+    running=false;
+    if (rafId) cancelAnimationFrame(rafId);
+    if (stream) stream.getTracks().forEach(track=>track.stop());
+    stream=null; video.srcObject=null; video.hidden=true;
+    $('placeholder').hidden=false;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    startBtn.disabled=false; stopBtn.disabled=true; resetValues();
+    if(update) setStatus('카메라가 중지되었습니다.');
+  }
+  startBtn.addEventListener('click',start);
+  stopBtn.addEventListener('click',()=>stopCamera(true));
+  window.addEventListener('resize',resizeCanvas);
+  window.addEventListener('beforeunload',()=>{if(stream) stream.getTracks().forEach(t=>t.stop());});
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus('이 브라우저에서는 카메라 API를 사용할 수 없습니다. HTTPS 또는 localhost에서 열어 주세요.',true);
+    startBtn.disabled=true;
+  }
+})();
+</script>
+</body>
+</html>
